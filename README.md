@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 
 # URBAN PULSE
 ## NYC 311 Citizen Complaint Analysis
@@ -50,3 +51,7 @@ An interactive Streamlit dashboard provides KPI cards, charts, and insights for 
 
 ### Data Source
 https://data.cityofnewyork.us/Social-Services/311-Service-Requests-from-2020-to-Present/erm2-nwe9
+=======
+# mini_project
+URBAN PULSE
+>>>>>>> 6acd572e3e51948734a153eb479d29b11d4c48fc
