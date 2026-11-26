@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 import mysql.connector
@@ -49,9 +50,12 @@ def pct(a, b):
 
 
 def insights(*points):
+    """Show findings in short, easy-to-read message boxes."""
     st.subheader("📌 Key Insights")
-    for p in points:
-        st.markdown(f"- {p}")
+    st.caption("A simple explanation of what the chart is showing.")
+
+    for number, point in enumerate(points, start=1):
+        st.markdown(f"**{number}.** {point}")
 
 
 def median_sql(group=None):
@@ -76,21 +80,137 @@ def median_sql(group=None):
 
 
 # --------------------------------------------------
+# Dashboard Filters
+# --------------------------------------------------
+# These option queries use the full dataset so the available choices do not
+# disappear when a filter is selected.
+date_bounds = query("""
+    SELECT MIN(DATE(created_date)), MAX(DATE(created_date))
+    FROM service_requests
+""")[0]
+
+min_date, max_date = date_bounds
+if min_date is None or max_date is None:
+    st.error("No created dates were found in the service_requests table.")
+    st.stop()
+
+borough_options = [
+    row[0] for row in query("""
+        SELECT DISTINCT borough
+        FROM service_requests
+        WHERE borough IS NOT NULL
+        ORDER BY borough
+    """)
+]
+
+complaint_options = [
+    row[0] for row in query("""
+        SELECT DISTINCT complaint_type
+        FROM service_requests
+        WHERE complaint_type IS NOT NULL
+        ORDER BY complaint_type
+    """)
+]
+
+st.sidebar.title("URBAN PULSE")
+st.sidebar.header("Dashboard Filters")
+
+date_range = st.sidebar.date_input(
+    "Created Date Range",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
+
+selected_boroughs = st.sidebar.multiselect(
+    "Select Borough",
+    options=borough_options,
+)
+
+selected_complaints = st.sidebar.multiselect(
+    "Select Complaint Type",
+    options=complaint_options,
+)
+
+# Streamlit may return one date while the user is still choosing a range.
+if isinstance(date_range, (tuple, list)):
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+    elif len(date_range) == 1:
+        start_date = end_date = date_range[0]
+    else:
+        start_date, end_date = min_date, max_date
+else:
+    start_date = end_date = date_range
+
+filter_conditions = ["DATE(created_date) BETWEEN %s AND %s"]
+filter_params = [start_date, end_date]
+
+if selected_boroughs:
+    placeholders = ", ".join(["%s"] * len(selected_boroughs))
+    filter_conditions.append(f"borough IN ({placeholders})")
+    filter_params.extend(selected_boroughs)
+
+if selected_complaints:
+    placeholders = ", ".join(["%s"] * len(selected_complaints))
+    filter_conditions.append(f"complaint_type IN ({placeholders})")
+    filter_params.extend(selected_complaints)
+
+FILTER_WHERE = " AND ".join(filter_conditions)
+
+
+def filtered_query(sql, params=None):
+    """Run an analysis query against rows matching the dashboard filters."""
+    match = re.search(r"\bFROM\s+service_requests\b", sql, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError("The analysis SQL must read from service_requests.")
+
+    # Keep any query parameters that appear before FROM in their original
+    # position (for example, the two parameters used in the skewness query).
+    params = tuple(params or ())
+    params_before_from = sql[:match.start()].count("%s")
+    ordered_params = (
+        params[:params_before_from]
+        + tuple(filter_params)
+        + params[params_before_from:]
+    )
+
+    filtered_table = (
+        "FROM (SELECT * FROM service_requests WHERE "
+        + FILTER_WHERE
+        + ") AS service_requests"
+    )
+    filtered_sql = re.sub(
+        r"\bFROM\s+service_requests\b",
+        lambda _: filtered_table,
+        sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return query(filtered_sql, ordered_params)
+
+
+# --------------------------------------------------
 # Headline KPIs
 # --------------------------------------------------
 try:
-    row = query("""
-        SELECT COUNT(DISTINCT unique_key),
-               COUNT(DISTINCT CASE WHEN is_closed = 1 THEN unique_key END),
-               COUNT(DISTINCT CASE WHEN is_closed = 0 THEN unique_key END),
-               COUNT(DISTINCT CASE WHEN resolution_hours > 72 THEN unique_key END)
-        FROM service_requests
-    """)[0]
+    row = filtered_query(f"""
+    SELECT COUNT(DISTINCT unique_key),
+           COUNT(DISTINCT CASE WHEN is_closed = 1 THEN unique_key END),
+           COUNT(DISTINCT CASE WHEN is_closed = 0 THEN unique_key END),
+           COUNT(DISTINCT CASE WHEN resolution_hours > 72 THEN unique_key END)
+    FROM service_requests
+""")[0]
     total, closed, open_, over_72 = (int(v or 0) for v in row)
-    med = query(median_sql())[0][0]
+    med = filtered_query(median_sql())[0][0]
     median_resolution = float(med) if med is not None else None
 except mysql.connector.Error as error:
     st.error(f"Database operation failed: {error}")
+    st.stop()
+
+if total == 0:
+    st.title("🏙️ URBAN PULSE")
+    st.warning("No records match the selected filters. Please change the date range, borough, or complaint type.")
     st.stop()
 
 st.title("🏙️ URBAN PULSE")
@@ -126,7 +246,7 @@ def analysis(name):
 
 @analysis("Total Complaint Volume")
 def total_volume():
-    unique, rows, first, last = query("""
+    unique, rows, first, last = filtered_query("""
         SELECT COUNT(DISTINCT unique_key), COUNT(*), MIN(created_date), MAX(created_date)
         FROM service_requests
     """)[0]
@@ -134,7 +254,7 @@ def total_volume():
     st.metric("Total Unique Complaints", f"{unique:,}")
     insights(
         f"The dataset holds **{unique:,}** unique complaints from {first:%d %b %Y} to {last:%d %b %Y} ({days:,} days).",
-        f"That works out to an average of **{unique / days:,.0f} complaints per day**.",
+        f"On average, about **{unique / days:,.0f} complaints were received each day**.",
         f"**{pct(closed, total)}** of requests are closed, leaving **{open_:,}** still open.",
         f"{rows - unique:,} duplicate rows were found on the complaint ID, so de-duplication is needed."
         if rows != unique else "Every complaint ID is unique, so the data is clean on this key.",
@@ -143,7 +263,7 @@ def total_volume():
 
 @analysis("Top 10 Complaint Categories")
 def top_categories():
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT complaint_type, COUNT(*) FROM service_requests
         WHERE complaint_type IS NOT NULL GROUP BY complaint_type ORDER BY 2 DESC LIMIT 10
     """), ["Complaint Category", TR])
@@ -151,15 +271,15 @@ def top_categories():
     n, t = df["Complaint Category"], df[TR]
     insights(
         f"**{n[0]}** is the most reported issue with {t[0]:,} requests ({pct(t[0], total)} of all complaints).",
-        f"The top 3 categories make up **{pct(t[:3].sum(), total)}** of volume; the top 10 make up **{pct(t.sum(), total)}**.",
-        f"The #1 category is **{t[0] / t[1]:.1f}x** larger than #2 ({n[1]}).",
-        f"The 10th category ({n.iloc[-1]}) has {t[0] / t.iloc[-1]:.1f}x fewer requests than the leader, a classic long-tail pattern.",
+        f"The three most common complaint types account for **{pct(t[:3].sum(), total)}** of requests. The top ten account for **{pct(t.sum(), total)}**.",
+        f"The most common complaint type was reported **{t[0] / t[1]:.1f} times** as often as the second most common type ({n[1]}).",
+        f"The tenth category ({n.iloc[-1]}) received far fewer reports than the most common category.",
     )
 
 
 @analysis("Agency Workload Distribution")
 def agency_workload():
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT agency, COUNT(*) FROM service_requests
         WHERE agency IS NOT NULL GROUP BY agency ORDER BY 2 DESC
     """), ["Agency", TR])
@@ -168,14 +288,14 @@ def agency_workload():
     insights(
         f"**{n[0]}** handles the most complaints: {t[0]:,} ({pct(t[0], t.sum())} of the workload).",
         f"The top 3 agencies carry **{pct(t[:3].sum(), t.sum())}** of all requests across {len(df)} agencies.",
-        f"The busiest agency handles **{t[0] / t.median():,.1f}x** the load of the median agency ({t.median():,.0f} requests).",
+        f"The busiest agency received **{t[0] / t.median():,.1f} times** as many requests as the middle agency ({t.median():,.0f} requests).",
         f"The lightest load belongs to **{n.iloc[-1]}** with only {t.iloc[-1]:,} requests.",
     )
 
 
 @analysis("Complaints by Borough")
 def by_borough():
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT borough, COUNT(*) FROM service_requests
         WHERE borough IS NOT NULL AND borough != 'Unknown' GROUP BY borough ORDER BY 2 DESC
     """), ["Borough", TR])
@@ -185,13 +305,13 @@ def by_borough():
         f"**{n[0]}** leads with {t[0]:,} complaints ({pct(t[0], t.sum())} of located complaints).",
         f"**{n.iloc[-1]}** reports the fewest ({t.iloc[-1]:,}), a **{t[0] / t.iloc[-1]:.1f}x** gap from the top borough.",
         f"The top two boroughs ({n[0]} and {n[1]}) together account for **{pct(t[:2].sum(), t.sum())}** of complaints.",
-        "Raw counts follow population size, so per-capita rates are the next step to judge which borough is truly worst.",
+        "A higher number of complaints does not automatically mean a borough has worse service. Population size should also be considered.",
     )
 
 
 @analysis("Monthly Complaint Trend")
 def monthly_trend():
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT DATE_FORMAT(created_date, '%Y-%m'), COUNT(*) FROM service_requests
         WHERE created_date IS NOT NULL GROUP BY 1 ORDER BY 1
     """), ["Month", TR])
@@ -201,7 +321,7 @@ def monthly_trend():
     insights(
         f"Peak month is **{m[hi]}** with {t[hi]:,} complaints; the quietest is **{m[lo]}** with {t[lo]:,} ({t[hi] / t[lo]:.1f}x difference).",
         f"The average month sees **{t.mean():,.0f}** complaints, and {(t > t.mean()).sum()} of {len(t)} months are above that.",
-        f"The latest month ({m.iloc[-1]}) is **{t.iloc[-1] / t.iloc[-2] - 1:+.1%}** versus {m.iloc[-2]}; check the month is complete before reading too much into it.",
+        f"Requests in the latest month ({m.iloc[-1]}) changed by **{t.iloc[-1] / t.iloc[-2] - 1:+.1%}** compared with {m.iloc[-2]}. This month may be incomplete.",
         f"From the first to the last month, volume changed by **{t.iloc[-1] / t.iloc[0] - 1:+.1%}**.",
     )
 
@@ -212,7 +332,7 @@ def weekday_hour():
 
     import matplotlib.pyplot as plt
 
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT
             created_weekday,
             created_hour,
@@ -293,7 +413,7 @@ def weekday_hour():
 
 @analysis("Request Status Distribution")
 def status_distribution():
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT status, COUNT(*) FROM service_requests
         WHERE status IS NOT NULL GROUP BY status ORDER BY 2 DESC
     """), ["Status", TR])
@@ -309,7 +429,7 @@ def status_distribution():
 
 @analysis("Resolution Time Statistics")
 def resolution_stats():
-    n, mean, mn, mx, sd = query(f"""
+    n, mean, mn, mx, sd = filtered_query(f"""
         SELECT COUNT(resolution_hours), AVG(resolution_hours), MIN(resolution_hours),
                MAX(resolution_hours), STDDEV_SAMP(resolution_hours)
         FROM service_requests WHERE {VALID}
@@ -329,13 +449,13 @@ def resolution_stats():
     insights(
         f"The mean ({mean:,.1f} hrs) is **{mean / med:.1f}x** the median ({med:,.1f} hrs), so a few very slow cases pull the average up. Use the median as the 'typical' time.",
         f"Half of all complaints are resolved within **{med:,.1f} hours** (about {med / 24:,.1f} days).",
-        f"The standard deviation is {sd / mean:.1f}x the mean, which signals highly unpredictable resolution times.",
-        f"The slowest case took **{mx / 24:,.0f} days**, which is {mx / med:,.0f}x the median; {pct(over_72, n)} of requests exceed 72 hours.",
+        f"Resolution times vary a lot. Some complaints are closed quickly, while others take much longer.",
+        f"The slowest case took **{mx / 24:,.0f} days** to close. **{pct(over_72, n)}** of valid requests took more than 72 hours.",
     )
 
 
 def median_by(col, label):
-    df = frame(query(median_sql(col)), [label, "Median Hours", "Valid Requests"])
+    df = frame(filtered_query(median_sql(col)), [label, "Median Hours", "Valid Requests"])
     st.caption("Showing the 15 slowest")
     st.bar_chart(df.head(15), x=label, y="Median Hours", horizontal=True)
     slow, fast = df.iloc[0], df.iloc[-1]
@@ -353,7 +473,7 @@ analysis("Median Resolution by Agency")(lambda: median_by("agency", "Agency"))
 
 @analysis("Resolution Time Outlier Analysis")
 def outliers():
-    q1, q3 = map(float, query(f"""
+    q1, q3 = map(float, filtered_query(f"""
         WITH r AS (
             SELECT resolution_hours AS h,
                    ROW_NUMBER() OVER (ORDER BY resolution_hours) AS rn,
@@ -366,7 +486,7 @@ def outliers():
     """)[0])
     iqr = q3 - q1
     lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    valid, n_out = query(
+    valid, n_out = filtered_query(
         f"SELECT COUNT(*), SUM(resolution_hours > %s) FROM service_requests WHERE {VALID}",
         (upper,),
     )[0]
@@ -390,18 +510,18 @@ def outliers():
         f"The middle 50% of complaints are resolved between **{q1:,.1f} and {q3:,.1f} hours** (IQR = {iqr:,.1f}).",
         f"The outlier cutoff is **{upper / median_resolution:,.1f}x** the median, so anything beyond it is an unusually slow case."
         + (" The lower limit is below zero, so only slow outliers exist." if lower < 0 else ""),
-        "These records are kept in the data and flagged for investigation rather than deleted, since they may be genuine service delays.",
+        "These unusually slow cases are kept in the dataset because they may represent real delays that need investigation.",
     )
 
 
 @analysis("Resolution Time Distribution and Skewness")
 def distribution():
-    n, mean, sd = query(f"""
+    n, mean, sd = filtered_query(f"""
         SELECT COUNT(*), AVG(resolution_hours), STDDEV_POP(resolution_hours)
         FROM service_requests WHERE {VALID}
     """)[0]
     mean, sd = float(mean), float(sd)
-    skew = query(f"""
+    skew = filtered_query(f"""
         SELECT AVG(POWER(resolution_hours - %s, 3)) / POWER(%s, 3)
         FROM service_requests WHERE {VALID}
     """, (mean, sd))[0][0]
@@ -414,7 +534,7 @@ def distribution():
     ]):
         col.metric(label, value)
 
-    df = frame(query(f"""
+    df = frame(filtered_query(f"""
         SELECT CASE WHEN resolution_hours < 1 THEN '1. Under 1h'
                     WHEN resolution_hours < 6 THEN '2. 1-6h'
                     WHEN resolution_hours < 24 THEN '3. 6-24h'
@@ -446,7 +566,7 @@ def distribution():
 
 @analysis("Geographic Complaint Concentration")
 def geo_concentration():
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT borough, COUNT(*) FROM service_requests
         WHERE borough IS NOT NULL AND borough != 'Unknown' GROUP BY borough ORDER BY 2 DESC
     """), ["Borough", "Total Complaints"])
@@ -457,15 +577,14 @@ def geo_concentration():
     insights(
         f"**{n[0]}** alone generates **{s[0]:.1f}%** of all located complaints.",
         f"The top two boroughs ({n[0]}, {n[1]}) together account for **{s[:2].sum():.1f}%**.",
-        f"The concentration index (HHI) is **{hhi:.2f}** versus {1 / k:.2f} for a perfectly even split, so complaints are "
-        f"{'concentrated in a few boroughs' if hhi * k > 1.3 else 'fairly evenly spread'}.",
-        f"The highest-share borough has **{s[0] / s.iloc[-1]:.1f}x** the share of the lowest ({n.iloc[-1]}), which helps prioritise field resources.",
+        f"{'A large share of complaints comes from a few boroughs.' if hhi * k > 1.3 else 'Complaints are spread fairly evenly across the boroughs.'}",
+        f"The share of complaints in {n[0]} is **{s[0] / s.iloc[-1]:.1f} times** the share in {n.iloc[-1]}.",
     )
 
 
 @analysis("Agency Closure Rate Comparison")
 def closure_rates():
-    df = frame(query("""
+    df = frame(filtered_query("""
         SELECT agency, COUNT(*), SUM(is_closed), ROUND(SUM(is_closed) * 100.0 / COUNT(*), 2)
         FROM service_requests WHERE agency IS NOT NULL GROUP BY agency ORDER BY 4 DESC
     """), ["Agency", TR, "Closed Requests", "Closure Rate (%)"])
@@ -485,7 +604,7 @@ def closure_rates():
 
 @analysis("High-Volume Complaints with Long Resolution")
 def high_volume_slow():
-    df = frame(query(f"""
+    df = frame(filtered_query(f"""
         SELECT complaint_type, COUNT(*), ROUND(AVG(resolution_hours), 2)
         FROM service_requests
         WHERE complaint_type IS NOT NULL AND {VALID}
@@ -498,16 +617,15 @@ def high_volume_slow():
     burden = (v * h).idxmax()
     insights(
         f"**{n[0]}** is the slowest high-volume category, averaging {h[0]:,.1f} hrs ({h[0] / 24:,.1f} days) across {v[0]:,} requests.",
-        f"Its average is **{h[0] / median_resolution:,.1f}x** the overall median, though averages are inflated by extreme cases, so compare with the median view.",
+        f"This category's average closure time is **{h[0] / median_resolution:,.1f} times** the overall middle closure time. A few very slow cases can increase an average.",
         f"{(h > 72).sum()} of these 10 categories average more than 72 hours.",
-        f"**{n[burden]}** carries the largest total delay burden (volume x average hours = {v[burden] * h[burden]:,.0f} hrs), making it the best target for process improvement.",
+        f"**{n[burden]}** has the largest combined delay because it has many requests and a high average closure time.",
     )
 
 
 # --------------------------------------------------
 # Sidebar menu and page
 # --------------------------------------------------
-st.sidebar.title("URBAN PULSE")
 selected = st.sidebar.selectbox("Select an Analysis", list(ANALYSES))
 st.header(selected)
 
